@@ -1,1 +1,1 @@
-"""Code for task 2 of the Auditory EEG ICASSP challenge."""
+"""Code for the ICASSP 2023 auditory eeg challenge."""
