@@ -1,133 +1,167 @@
-"""2 mismatched segments dilation model."""
+"""Example experiment for the 2 mismatched segments dilation model."""
+import glob
+import json
+import logging
+import os, sys
 import tensorflow as tf
 
+import sys
+# add base path to sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+from task1_match_mismatch.models.dilated_convolutional_model import dilation_model
 
-def dilation_model(
-    time_window=None,
-    eeg_input_dimension=64,
-    env_input_dimension=1,
-    layers=3,
-    kernel_size=3,
-    spatial_filters=8,
-    dilation_filters=16,
-    activation="relu",
-    compile=True,
-    num_mismatched_segments=2
-):
-    """Convolutional dilation model.
+from util.dataset_generator import DataGenerator, batch_equalizer_fn, create_tf_dataset
 
-    Code was taken and adapted from
-    https://github.com/exporl/eeg-matching-eusipco2020
+
+def evaluate_model(model, test_dict):
+    """Evaluate a model.
 
     Parameters
     ----------
-    time_window : int or None
-        Segment length. If None, the model will accept every time window input
-        length.
-    eeg_input_dimension : int
-        number of channels of the EEG
-    env_input_dimension : int
-        dimemsion of the stimulus representation.
-        if stimulus == envelope, env_input_dimension =1
-        if stimulus == mel, env_input_dimension =28
-    layers : int
-        Depth of the network/Number of layers
-    kernel_size : int
-        Size of the kernel for the dilation convolutions
-    spatial_filters : int
-        Number of parallel filters to use in the spatial layer
-    dilation_filters : int
-        Number of parallel filters to use in the dilation layers
-    activation : str or list or tuple
-        Name of the non-linearity to apply after the dilation layers
-        or list/tuple of different non-linearities
-    compile : bool
-        If model should be compiled
-    inputs : tuple
-        Alternative inputs
+    model: tf.keras.Model
+        Model to evaluate.
+    test_dict: dict
+        Mapping between a subject and a tf.data.Dataset containing the test
+        set for the subject.
 
     Returns
     -------
-    tf.Model
-        The dilation model
-
-
-    References
-    ----------
-    Accou, B., Jalilpour Monesi, M., Montoya, J., Van hamme, H. & Francart, T.
-    Modeling the relationship between acoustic stimulus and EEG with a dilated
-    convolutional neural network. In 2020 28th European Signal Processing
-    Conference (EUSIPCO), 1175–1179, DOI: 10.23919/Eusipco47968.2020.9287417
-    (2021). ISSN: 2076-1465.
-
-    Accou, B., Monesi, M. J., hamme, H. V. & Francart, T.
-    Predicting speech intelligibility from EEG in a non-linear classification
-    paradigm. J. Neural Eng. 18, 066008, DOI: 10.1088/1741-2552/ac33e9 (2021).
-    Publisher: IOP Publishing
+    dict
+        Mapping between a subject and the loss/evaluation score on the test set
     """
+    evaluation = {}
+    for subject, ds_test in test_dict.items():
+        logging.info(f"Scores for subject {subject}:")
+        results = model.evaluate(ds_test, verbose=2)
+        metrics = model.metrics_names
+        evaluation[subject] = dict(zip(metrics, results))
+    return evaluation
 
-    eeg = tf.keras.layers.Input(shape=[time_window, eeg_input_dimension])
-    stimuli_input = [tf.keras.layers.Input(shape=[time_window, env_input_dimension]) for _ in range(num_mismatched_segments+1)]
 
-    all_inputs = [eeg]
-    all_inputs.extend(stimuli_input)
+if __name__ == "__main__":
+    # Parameters
+    # Length of the decision window
+    window_length_s = 5
+    fs = 64
+
+    window_length = window_length_s * fs  # 5 seconds
+    # Hop length between two consecutive decision windows
+    hop_length = 64
+
+    epochs = 100
+    patience = 5
+    batch_size = 64
+    only_evaluate = True
+    number_mismatch = 4 # or 4
 
 
-    stimuli_proj = [x for x in stimuli_input]
 
-    # Activations to apply
-    if isinstance(activation, str):
-        activations = [activation] * layers
+    training_log_filename = "training_log_{}_{}.csv".format(number_mismatch, window_length_s)
+
+
+
+    # Get the path to the config gile
+    experiments_folder = os.path.dirname(__file__)
+    task_folder = os.path.dirname(experiments_folder)
+    util_folder = os.path.join(os.path.dirname(task_folder), "util")
+    config_path = os.path.join(util_folder, 'config.json')
+
+    # Load the config
+    with open(config_path) as fp:
+        config = json.load(fp)
+
+    # Provide the path of the dataset
+    # which is split already to train, val, test
+    data_folder = os.path.join(config["dataset_folder"], config['derivatives_folder'], config["split_folder"])
+
+    # stimulus feature which will be used for training the model. Can be either 'envelope' ( dimension 1) or 'mel' (dimension 28)
+    stimulus_features = ["envelope"]
+    stimulus_dimension = 1
+
+    # uncomment if you want to train with the mel spectrogram stimulus representation
+    # stimulus_features = ["mel"]
+    # stimulus_dimension = 10
+
+    features = ["eeg"] + stimulus_features
+
+    # Create a directory to store (intermediate) results
+    results_folder = os.path.join(experiments_folder, "results_dilated_convolutional_model_{}_MM_{}_s_{}".format(number_mismatch, window_length_s, stimulus_features[0]))
+    os.makedirs(results_folder, exist_ok=True)
+
+    # create dilation model
+    model = dilation_model(time_window=window_length, eeg_input_dimension=64, env_input_dimension=stimulus_dimension, num_mismatched_segments = number_mismatch)
+
+    model_path = os.path.join(results_folder, "model_{}_MM_{}_s_{}.h5".format(number_mismatch, window_length_s, stimulus_features[0]))
+
+    if only_evaluate:
+        model = tf.keras.models.load_model(model_path)
+
     else:
-        activations = activation
+
+        train_files = [x for x in glob.glob(os.path.join(data_folder, "train_-_*")) if os.path.basename(x).split("_-_")[-1].split(".")[0] in features]
+        # Create list of numpy array files
+        train_generator = DataGenerator(train_files, window_length)
+        import pdb
+        dataset_train = create_tf_dataset(train_generator, window_length, batch_equalizer_fn,
+                                          hop_length, batch_size,
+                                          number_mismatch=number_mismatch,
+                                          data_types=(tf.float32, tf.float32),
+                                          feature_dims=(64, stimulus_dimension))
+
+        # Create the generator for the validation set
+        val_files = [x for x in glob.glob(os.path.join(data_folder, "val_-_*")) if os.path.basename(x).split("_-_")[-1].split(".")[0] in features]
+        val_generator = DataGenerator(val_files, window_length)
+        dataset_val = create_tf_dataset(val_generator,  window_length, batch_equalizer_fn,
+                                          hop_length, batch_size,
+                                          number_mismatch=number_mismatch,
+                                          data_types=(tf.float32, tf.float32),
+                                          feature_dims=(64, stimulus_dimension))
 
 
-    # Spatial convolution
-    eeg_proj_1 = tf.keras.layers.Conv1D(spatial_filters, kernel_size=1)(eeg)
-
-    # Construct dilation layers
-    for layer_index in range(layers):
-        # dilation on EEG
-        eeg_proj_1 = tf.keras.layers.Conv1D(
-            dilation_filters,
-            kernel_size=kernel_size,
-            dilation_rate=kernel_size ** layer_index,
-            strides=1,
-            activation=activations[layer_index],
-        )(eeg_proj_1)
-
-        # Dilation on envelope data, share weights
-        env_proj_layer = tf.keras.layers.Conv1D(
-            dilation_filters,
-            kernel_size=kernel_size,
-            dilation_rate=kernel_size ** layer_index,
-            strides=1,
-            activation=activations[layer_index],
+        # Train the model
+        model.fit(
+            dataset_train,
+            epochs=epochs,
+            validation_data=dataset_val,
+            callbacks=[
+                tf.keras.callbacks.ModelCheckpoint(model_path, save_best_only=True),
+                tf.keras.callbacks.CSVLogger(os.path.join(results_folder, training_log_filename)),
+                tf.keras.callbacks.EarlyStopping(patience=patience, restore_best_weights=True),
+            ],
         )
 
-        stimuli_proj = [env_proj_layer(stimulus_proj) for stimulus_proj in stimuli_proj]
+    test_window_lengths = [3,5]
+    number_mismatch_test = [2,3,4, 8]
+    for number_mismatch in number_mismatch_test:
+        for window_length_s in test_window_lengths:
+            window_length = window_length_s * fs
+            results_filename = 'eval_{}_{}_s.json'.format(number_mismatch, window_length_s)
 
+            model = dilation_model(time_window=window_length, eeg_input_dimension=64,
+                                   env_input_dimension=stimulus_dimension, num_mismatched_segments=number_mismatch)
 
-    # Comparison
-    cos = [tf.keras.layers.Dot(1, normalize=True)([eeg_proj_1, stimulus_proj]) for stimulus_proj in stimuli_proj]
+            model.load_weights(model_path)
+            # Evaluate the model on test set
+            # Create a dataset generator for each test subject
+            test_files = [x for x in glob.glob(os.path.join(data_folder, "test_-_*")) if
+                          os.path.basename(x).split("_-_")[-1].split(".")[0] in features]
+            # Get all different subjects from the test set
+            subjects = list(set([os.path.basename(x).split("_-_")[1] for x in test_files]))
+            datasets_test = {}
+            # Create a generator for each subject
+            for sub in subjects:
+                files_test_sub = [f for f in test_files if sub in os.path.basename(f)]
+                test_generator = DataGenerator(files_test_sub, window_length)
+                datasets_test[sub] = create_tf_dataset(test_generator, window_length, batch_equalizer_fn,
+                                                       hop_length, batch_size=1,
+                                                       number_mismatch=number_mismatch,
+                                                       data_types=(tf.float32, tf.float32),
+                                                       feature_dims=(64, stimulus_dimension))
 
-    linear_proj_sim = tf.keras.layers.Dense(1, activation="linear")
+            evaluation = evaluate_model(model, datasets_test)
 
-    # Linear projection of similarity matrices
-    cos_proj = [linear_proj_sim(tf.keras.layers.Flatten()(cos_i)) for cos_i in cos]
-
-
-    # Classification
-    out = tf.keras.activations.softmax((tf.keras.layers.Concatenate()(cos_proj)))
-
-
-    model = tf.keras.Model(inputs=all_inputs, outputs=[out])
-
-    if compile:
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(),
-            metrics=["accuracy"],
-            loss=["categorical_crossentropy"],
-        )
-        print(model.summary())
-    return model
+            # We can save our results in a json encoded file
+            results_path = os.path.join(results_folder, results_filename)
+            with open(results_path, "w") as fp:
+                json.dump(evaluation, fp)
+            logging.info(f"Results saved at {results_path}")
